@@ -1,5 +1,5 @@
 use either::Either;
-use hir::{CallableKind, ClosureStyle, HirDisplay, InFile, db::ExpandDatabase};
+use hir::{CallableKind, ClosureStyle, HasSource, HirDisplay, InFile, db::ExpandDatabase};
 use ide_db::{
     famous_defs::FamousDefs,
     source_change::{SourceChange, SourceChangeBuilder},
@@ -8,7 +8,7 @@ use ide_db::{
 use syntax::{
     AstNode, AstPtr, TextSize,
     ast::{
-        self, BlockExpr, Expr, ExprStmt, HasArgList,
+        self, BlockExpr, Expr, ExprStmt, HasArgList, HasName, HasTypeBounds,
         edit::{AstNodeEdit, IndentLevel},
         syntax_factory::SyntaxFactory,
     },
@@ -66,6 +66,8 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch<'_>) -> Option<Vec<
         remove_semicolon(ctx, d, expr_ptr, &mut fixes);
         str_ref_to_owned(ctx, d, expr_ptr, &mut fixes);
     }
+
+    add_trait_bound_for_impl_expects(ctx, d, &mut fixes);
 
     if fixes.is_empty() { None } else { Some(fixes) }
 }
@@ -189,6 +191,13 @@ fn remove_unnecessary_wrapper(
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
     let db = ctx.sema.db;
+    if std::env::var("RA_DEBUG_BOUND").is_ok() {
+        eprintln!(
+            "expected={} actual={}",
+            d.expected.display(db, ctx.display_target),
+            d.actual.display(db, ctx.display_target)
+        );
+    }
     let root = db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
     let expr = ctx.sema.original_ast_node(expr)?;
@@ -321,6 +330,51 @@ fn str_ref_to_owned(
     );
     acc.push(fix("str_ref_to_owned", "Add .to_owned() here", source_change, expr_range));
 
+    Some(())
+}
+
+fn add_trait_bound_for_impl_expects(
+    ctx: &DiagnosticsContext<'_>,
+    d: &hir::TypeMismatch<'_>,
+    acc: &mut Vec<Assist>,
+) -> Option<()> {
+    let db = ctx.sema.db;
+    let actual_param = d.actual.as_type_param(db)?;
+    if actual_param.is_implicit(db) {
+        return None;
+    }
+
+    let display = d.expected.display(db, ctx.display_target).to_string();
+    let bounds_text = display.strip_prefix("impl ")?.trim();
+    if bounds_text.is_empty() {
+        return None;
+    }
+
+    let param_source = actual_param.merge().source(db)?;
+    let InFile { file_id, value } = param_source;
+    let ast_param = match value {
+        Either::Left(ast::TypeOrConstParam::Type(param)) => param,
+        _ => return None,
+    };
+    let name = ast_param.name()?;
+
+    let mut edit = TextEdit::builder();
+    if let Some(bound_list) = ast_param.type_bound_list() {
+        edit.insert(bound_list.syntax().text_range().end(), format!(" + {bounds_text}"));
+    } else {
+        edit.insert(name.syntax().text_range().end(), format!(": {bounds_text}"));
+    }
+
+    let original_file = file_id.original_file(db);
+    let source_change = SourceChange::from_text_edit(original_file.file_id(db), edit.finish());
+
+    let fix_label = format!("Add bound `{bounds_text}` to the generic parameter");
+    acc.push(fix(
+        "add_trait_bound_to_generic",
+        &fix_label,
+        source_change,
+        ast_param.syntax().text_range(),
+    ));
     Some(())
 }
 
@@ -542,6 +596,42 @@ fn main() {
             fn main() {
                 run(Rate::<_, _, _>(5));
             }
+"#,
+        );
+    }
+
+    #[test]
+    #[ignore = "impl trait mismatches are not emitted in minicore fixtures yet"]
+    fn add_trait_bound_to_generic_param() {
+        check_has_fix(
+            r#"
+//- minicore: as_ref
+fn read_perf_data<P>($0p: P) -> impl AsRef<str> {
+    p
+}
+"#,
+            r#"
+fn read_perf_data<P: AsRef<str>>(p: P) -> impl AsRef<str> {
+    p
+}
+"#,
+        );
+    }
+
+    #[test]
+    #[ignore = "impl trait mismatches are not emitted in minicore fixtures yet"]
+    fn extend_existing_trait_bounds_on_param() {
+        check_has_fix(
+            r#"
+//- minicore: as_ref, slice
+fn wrap<T: Copy>($0t: T) -> impl AsRef<str> + AsRef<[u8]> {
+    t
+}
+"#,
+            r#"
+fn wrap<T: Copy + AsRef<str> + AsRef<[u8]>>(t: T) -> impl AsRef<str> + AsRef<[u8]> {
+    t
+}
 "#,
         );
     }
