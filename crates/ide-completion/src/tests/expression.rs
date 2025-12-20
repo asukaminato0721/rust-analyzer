@@ -5,7 +5,7 @@ use crate::{
     CompletionConfig,
     config::AutoImportExclusionType,
     tests::{
-        BASE_ITEMS_FIXTURE, TEST_CONFIG, check, check_edit, check_with_base_items,
+        BASE_ITEMS_FIXTURE, TEST_CONFIG, check, check_edit, check_no_kw, check_with_base_items,
         completion_list_with_config,
     },
 };
@@ -2508,6 +2508,48 @@ fn main() {
             sn macro_rules
             sn pd
             sn ppd
+        "#]],
+    );
+}
+
+#[test]
+fn crossbeam_select_like_macro() {
+    check_no_kw(
+        r#"
+macro_rules! crossbeam_channel_internal {
+    (recv($recv:expr) -> $pat:pat => $recv_body:block, default => $default_body:block $(,)?) => {{
+        let $pat: Foo = $recv;
+        $recv_body
+    }};
+}
+
+macro_rules! select {
+    ($($tokens:tt)*) => {{
+        const _: bool = false;
+        crossbeam_channel_internal!($($tokens)*)
+    }};
+}
+
+struct Foo;
+impl Foo {
+    fn foo(&self) {}
+}
+
+fn make_foo() -> Foo {
+    Foo
+}
+
+fn main() {
+    select! {
+        recv(make_foo()) -> message => {
+            message.f$0
+        },
+        default => {}
+    }
+}
+"#,
+        expect![[r#"
+            me foo() fn(&self)
         "#]],
     );
 }

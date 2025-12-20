@@ -6,8 +6,8 @@ use ide_db::{RootDatabase, active_parameter::ActiveParameter};
 use itertools::Either;
 use stdx::always;
 use syntax::{
-    AstNode, AstToken, Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-    T, TextRange, TextSize,
+    AstNode, AstToken, Direction, Edition, NodeOrToken, SourceFile, SyntaxElement, SyntaxKind,
+    SyntaxNode, SyntaxToken, T, TextRange, TextSize,
     algo::{
         self, ancestors_at_offset, find_node_at_offset, non_trivia_sibling,
         previous_non_trivia_token,
@@ -215,22 +215,15 @@ fn expand(
                 Some(ExpandResult { value: actual_expansion, err: _ }),
                 Some((fake_expansion, fake_mapped_tokens)),
             ) => {
-                let mut accumulated_offset_from_fake_tokens = 0;
                 let actual_range = actual_expansion.text_range().end();
-                let result = fake_mapped_tokens
+                let result = completion_marker_tokens(fake_mapped_tokens)
                     .into_iter()
-                    .filter_map(|(fake_mapped_token, rank)| {
-                        let accumulated_offset = accumulated_offset_from_fake_tokens;
-                        if !fake_mapped_token.text().contains(COMPLETION_MARKER) {
-                            // Proc macros can make the same span with different text, we don't
-                            // want them to participate in completion because the macro author probably
-                            // didn't intend them to.
-                            return None;
-                        }
-                        accumulated_offset_from_fake_tokens += COMPLETION_MARKER.len();
-
-                        let new_offset = fake_mapped_token.text_range().start()
-                            - TextSize::new(accumulated_offset as u32);
+                    .enumerate()
+                    .filter_map(|(idx, (fake_mapped_token, rank))| {
+                        let accumulated_offset =
+                            TextSize::new((idx * COMPLETION_MARKER.len()) as u32);
+                        let new_offset =
+                            fake_mapped_token.text_range().start() - accumulated_offset;
                         if new_offset + relative_offset > actual_range {
                             // offset outside of bounds from the original expansion,
                             // stop here to prevent problems from happening
@@ -333,22 +326,15 @@ fn expand(
                         // we are inside a derive helper token tree, treat this as being inside
                         // the derive expansion
                         let actual_expansion = sema.parse_or_expand(file.into());
-                        let mut accumulated_offset_from_fake_tokens = 0;
                         let actual_range = actual_expansion.text_range().end();
-                        let result = fake_mapped_tokens
+                        let result = completion_marker_tokens(fake_mapped_tokens)
                             .into_iter()
-                            .filter_map(|(fake_mapped_token, rank)| {
-                                let accumulated_offset = accumulated_offset_from_fake_tokens;
-                                if !fake_mapped_token.text().contains(COMPLETION_MARKER) {
-                                    // Proc macros can make the same span with different text, we don't
-                                    // want them to participate in completion because the macro author probably
-                                    // didn't intend them to.
-                                    return None;
-                                }
-                                accumulated_offset_from_fake_tokens += COMPLETION_MARKER.len();
-
-                                let new_offset = fake_mapped_token.text_range().start()
-                                    - TextSize::new(accumulated_offset as u32);
+                            .enumerate()
+                            .filter_map(|(idx, (fake_mapped_token, rank))| {
+                                let accumulated_offset =
+                                    TextSize::new((idx * COMPLETION_MARKER.len()) as u32);
+                                let new_offset =
+                                    fake_mapped_token.text_range().start() - accumulated_offset;
                                 if new_offset + relative_offset > actual_range {
                                     // offset outside of bounds from the original expansion,
                                     // stop here to prevent problems from happening
@@ -398,22 +384,13 @@ fn expand(
     ) {
         // successful expansions
         (Some(actual_expansion), Some((fake_expansion, fake_mapped_tokens))) => {
-            let mut accumulated_offset_from_fake_tokens = 0;
             let actual_range = actual_expansion.text_range().end();
-            fake_mapped_tokens
+            completion_marker_tokens(fake_mapped_tokens)
                 .into_iter()
-                .filter_map(|(fake_mapped_token, rank)| {
-                    let accumulated_offset = accumulated_offset_from_fake_tokens;
-                    if !fake_mapped_token.text().contains(COMPLETION_MARKER) {
-                        // Proc macros can make the same span with different text, we don't
-                        // want them to participate in completion because the macro author probably
-                        // didn't intend them to.
-                        return None;
-                    }
-                    accumulated_offset_from_fake_tokens += COMPLETION_MARKER.len();
-
-                    let new_offset = fake_mapped_token.text_range().start()
-                        - TextSize::new(accumulated_offset as u32);
+                .enumerate()
+                .filter_map(|(idx, (fake_mapped_token, rank))| {
+                    let accumulated_offset = TextSize::new((idx * COMPLETION_MARKER.len()) as u32);
+                    let new_offset = fake_mapped_token.text_range().start() - accumulated_offset;
                     if new_offset + relative_offset > actual_range {
                         // offset outside of bounds from the original expansion,
                         // stop here to prevent problems from happening
@@ -435,6 +412,44 @@ fn expand(
         // at least one expansion failed, we won't have anything to expand from this point
         // onwards so break out
         _ => None,
+    }
+}
+
+fn completion_marker_tokens(fake_mapped_tokens: Vec<(SyntaxToken, u8)>) -> Vec<(SyntaxToken, u8)> {
+    let mut tokens: Vec<_> = fake_mapped_tokens
+        .into_iter()
+        .filter(|(token, _)| token.text().contains(COMPLETION_MARKER))
+        .collect();
+    // `expand_speculative` doesn't guarantee any order for mapped tokens, but we need to
+    // adjust offsets in textual order, so sort them deterministically.
+    tokens.sort_by_key(|(token, rank)| (token.text_range().start(), *rank));
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sorts_completion_marker_tokens_by_offset() {
+        let parse = SourceFile::parse(
+            &format!("fn main() {{ {} {}; }}", COMPLETION_MARKER, COMPLETION_MARKER),
+            Edition::CURRENT,
+        )
+        .tree();
+        let tokens: Vec<_> = parse
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.text().contains(COMPLETION_MARKER))
+            .collect();
+        assert_eq!(tokens.len(), 2);
+
+        let reversed = vec![(tokens[1].clone(), 1), (tokens[0].clone(), 0)];
+        let sorted = completion_marker_tokens(reversed);
+
+        assert_eq!(sorted[0].0.text_range().start(), tokens[0].text_range().start());
+        assert_eq!(sorted[1].0.text_range().start(), tokens[1].text_range().start());
     }
 }
 
