@@ -59,7 +59,7 @@ fn fixes(
 mod tests {
     use crate::{
         DiagnosticsConfig,
-        tests::{check_diagnostics_with_config, check_fix},
+        tests::{check_diagnostics_with_config, check_fix, check_has_fix},
     };
 
     #[track_caller]
@@ -182,6 +182,24 @@ fn foo() {
     let _m = core::iter::repeat(()).filter_map(|()| Some(92)).next();
 }          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 💡 warn: replace filter_map(..).next() with find_map(..)
 
+"#,
+        );
+    }
+
+    #[test]
+    fn allow_attribute_fix_for_filter_map_next() {
+        check_has_fix(
+            r#"
+//- minicore: iterators
+fn foo() {
+    let _m = core::iter::repeat(()).$0filter_map(|()| Some(92)).next();
+}
+"#,
+            r#"
+#[allow(clippy::filter_map_next)]
+fn foo() {
+    let _m = core::iter::repeat(()).filter_map(|()| Some(92)).next();
+}
 "#,
         );
     }

@@ -96,15 +96,16 @@ use hir::{
 use ide_db::{
     FileId, FileRange, FxHashMap, FxHashSet, RootDatabase, Severity, SnippetCap,
     assists::{Assist, AssistId, AssistResolveStrategy, ExprFillDefaultMode},
-    base_db::{ReleaseChannel, RootQueryDb as _},
+    base_db::{ReleaseChannel, RootQueryDb as _, SourceDatabase},
     generated::lints::{CLIPPY_LINT_GROUPS, DEFAULT_LINT_GROUPS, DEFAULT_LINTS, Lint, LintGroup},
     imports::insert_use::InsertUseConfig,
     label::Label,
     source_change::SourceChange,
+    text_edit::TextEdit,
 };
 use syntax::{
-    AstPtr, Edition, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange,
-    ast::{self, AstNode},
+    AstPtr, Edition, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
+    ast::{self, AstNode, edit::IndentLevel},
 };
 
 // FIXME: Make this an enum
@@ -621,6 +622,18 @@ fn handle_lints(
         if let Some(diag_severity) = diag_severity {
             diag.severity = diag_severity;
         }
+
+        let attr_name = match diag.code {
+            DiagnosticCode::RustcLint(name) => Some(name.to_owned()),
+            DiagnosticCode::Clippy(name) => Some(format!("clippy::{name}")),
+            _ => None,
+        };
+
+        if let Some(attr_name) = attr_name {
+            if let Some(fix) = allow_attribute_fix(sema, diag, node, &attr_name) {
+                diag.fixes.get_or_insert_with(Vec::new).push(fix);
+            }
+        }
     }
 }
 
@@ -729,6 +742,105 @@ fn lint_groups(lint: &DiagnosticCode, edition: Edition) -> LintGroups {
         _ => panic!("non-lint passed to `handle_lints()`"),
     };
     LintGroups { groups, inside_warnings }
+}
+
+fn allow_attribute_fix(
+    sema: &Semantics<'_, RootDatabase>,
+    diag: &Diagnostic,
+    node: &InFile<SyntaxNode>,
+    lint_name: &str,
+) -> Option<Assist> {
+    let Some(file_id) = node.file_id.file_id() else { return None };
+
+    if node.file_id.is_macro() {
+        return None;
+    }
+
+    let vfs_file_id = file_id.file_id(sema.db);
+    let file_text = sema.db.file_text(vfs_file_id).text(sema.db);
+
+    let (insert_offset, edit_text) = match find_allow_attr_target(&node.value) {
+        AllowAttrTarget::Outer(owner) => {
+            let indent = format!("{}", IndentLevel::from_node(&owner));
+            let offset = owner.text_range().start();
+            let text = build_outer_allow_text(file_text, offset, lint_name, &indent);
+            (offset, text)
+        }
+        AllowAttrTarget::Crate => (TextSize::from(0), build_crate_allow_text(lint_name)),
+    };
+
+    if edit_text.is_empty() {
+        return None;
+    }
+
+    let mut edit = TextEdit::builder();
+    edit.insert(insert_offset, edit_text);
+    let edit = edit.finish();
+    if edit.is_empty() {
+        return None;
+    }
+
+    let label = format!("Add #[allow({lint_name})]");
+    Some(fix(
+        "allow_lint_attr",
+        &label,
+        SourceChange::from_text_edit(vfs_file_id, edit),
+        diag.range.range,
+    ))
+}
+
+enum AllowAttrTarget {
+    Outer(SyntaxNode),
+    Crate,
+}
+
+fn find_allow_attr_target(node: &SyntaxNode) -> AllowAttrTarget {
+    for ancestor in node.ancestors() {
+        if ast::Item::cast(ancestor.clone()).is_some()
+            || ast::AssocItem::cast(ancestor.clone()).is_some()
+        {
+            return AllowAttrTarget::Outer(ancestor.clone());
+        }
+    }
+
+    for ancestor in node.ancestors() {
+        if ast::Stmt::cast(ancestor.clone()).is_some()
+            || ast::Expr::cast(ancestor.clone()).is_some()
+        {
+            return AllowAttrTarget::Outer(ancestor.clone());
+        }
+    }
+
+    AllowAttrTarget::Crate
+}
+
+fn build_outer_allow_text(
+    file_text: &str,
+    insert_offset: TextSize,
+    lint_name: &str,
+    indent: &str,
+) -> String {
+    let mut text = String::new();
+    if needs_newline_before(file_text, insert_offset) {
+        text.push('\n');
+    }
+    text.push_str("#[allow(");
+    text.push_str(lint_name);
+    text.push_str(")]\n");
+    text.push_str(indent);
+    text
+}
+
+fn build_crate_allow_text(lint_name: &str) -> String {
+    format!("#![allow({lint_name})]\n\n")
+}
+
+fn needs_newline_before(text: &str, offset: TextSize) -> bool {
+    let idx: usize = offset.into();
+    if idx == 0 {
+        return false;
+    }
+    !matches!(text.as_bytes().get(idx - 1), Some(b'\n'))
 }
 
 fn fix(id: &'static str, label: &str, source_change: SourceChange, target: TextRange) -> Assist {

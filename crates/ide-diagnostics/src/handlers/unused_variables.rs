@@ -92,7 +92,7 @@ fn fixes(
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_diagnostics, check_fix};
+    use crate::tests::{check_diagnostics, check_fix, check_has_fix};
 
     #[test]
     fn unused_variables_simple() {
@@ -426,6 +426,23 @@ fn main() {
 fn main() {
     let x = 2;
       //^ 💡 warn: unused variable
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn allow_attribute_quick_fix_is_available() {
+        check_has_fix(
+            r#"
+fn main() {
+    let value$0 = 2;
+}
+"#,
+            r#"
+#[allow(unused_variables)]
+fn main() {
+    let value = 2;
 }
 "#,
         );
