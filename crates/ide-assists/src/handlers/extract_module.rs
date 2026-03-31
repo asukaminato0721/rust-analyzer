@@ -1,21 +1,26 @@
-use std::{iter::once, ops::RangeInclusive};
+use std::{
+    iter::{self, once},
+    ops::RangeInclusive,
+};
 
 use hir::{HasSource, ModuleSource};
 use ide_db::{
     FileId, FxHashMap, FxHashSet,
     assists::AssistId,
+    base_db::AnchoredPathBuf,
     defs::{Definition, NameClass, NameRefClass},
     search::{FileReference, SearchScope},
 };
 use itertools::Itertools;
 use smallvec::SmallVec;
+use stdx::format_to;
 use syntax::{
-    AstNode,
+    AstNode, SmolStr,
     SyntaxKind::{self, WHITESPACE},
     SyntaxNode, TextRange, TextSize,
     algo::find_node_at_range,
     ast::{
-        self, HasVisibility,
+        self, HasName, HasVisibility,
         edit::{AstNodeEdit, IndentLevel},
         make,
     },
@@ -69,7 +74,7 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
     }
 
     let selection_range = ctx.selection_trimmed();
-    let (mut module, module_text_range) = if let Some(item) = ast::Item::cast(node.clone()) {
+    let (module, module_text_range) = if let Some(item) = ast::Item::cast(node.clone()) {
         let module = extract_single_target(&item);
         (module, node.text_range())
     } else {
@@ -98,11 +103,28 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         impl_parent = Some(impl_);
     }
 
+    let can_extract_to_file = impl_parent.is_some()
+        || module.body_items.first().and_then(|item| item.syntax().parent()).is_some_and(
+            |parent| matches!(parent.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST),
+        );
+    let file_path = can_extract_to_file
+        .then(|| extracted_module_file_path(ctx, curr_parent_module.clone(), module.name))
+        .flatten();
+    let inline_module = module.clone();
+    let inline_curr_parent_module = curr_parent_module.clone();
+    let inline_impl_parent = impl_parent.clone();
+    let inline_old_items = old_items.clone();
+    let file_module = module.clone();
+    let file_curr_parent_module = curr_parent_module.clone();
+    let file_impl_parent = impl_parent.clone();
+    let file_old_items = old_items.clone();
+
     acc.add(
         AssistId::refactor_extract("extract_module"),
         "Extract Module",
         module_text_range,
-        |builder| {
+        move |builder| {
+            let mut module = inline_module.clone();
             //This takes place in three steps:
             //
             //- Firstly, we will update the references(usages) e.g. converting a
@@ -126,10 +148,11 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
                 builder.insert(ctx.selection_trimmed().end(), format!("\n{use_stmt}"));
             });
 
-            let import_items = module.resolve_imports(curr_parent_module, ctx);
+            let import_items = module.resolve_imports(inline_curr_parent_module.clone(), ctx);
             module.change_visibility(record_fields);
 
-            let module_def = generate_module_def(&impl_parent, &module).indent(old_item_indent);
+            let module_def =
+                generate_module_def(&inline_impl_parent, &module).indent(old_item_indent);
 
             let mut usages_to_be_processed_for_cur_file = vec![];
             for (file_id, usages) in usages_to_be_processed {
@@ -148,14 +171,14 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
                 builder.replace(text_range, usage);
             }
 
-            if let Some(impl_) = impl_parent {
+            if let Some(impl_) = inline_impl_parent.clone() {
                 // Remove complete impl block if it has only one child (as such it will be empty
                 // after deleting that child)
-                let nodes_to_be_removed = if impl_child_count == old_items.len() {
+                let nodes_to_be_removed = if impl_child_count == inline_old_items.len() {
                     vec![impl_.syntax()]
                 } else {
                     //Remove selected node
-                    old_items.iter().map(|it| it.syntax()).collect()
+                    inline_old_items.iter().map(|it| it.syntax()).collect()
                 };
 
                 for node_to_be_removed in nodes_to_be_removed {
@@ -179,7 +202,84 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
                 builder.replace(module_text_range, module_def.to_string())
             }
         },
-    )
+    );
+
+    if let Some(file_path) = file_path {
+        acc.add(
+            AssistId::refactor_extract("extract_module_to_file"),
+            "Extract module to file",
+            module_text_range,
+            move |builder| {
+                let module = file_module.clone();
+                let (usages_to_be_processed, record_fields, use_stmts_to_be_inserted) =
+                    module.get_usages_and_record_fields(ctx, module_text_range);
+
+                builder.edit_file(ctx.vfs_file_id());
+                use_stmts_to_be_inserted.into_iter().for_each(|(_, use_stmt)| {
+                    builder.insert(ctx.selection_trimmed().end(), format!("\n{use_stmt}"));
+                });
+
+                let mut module = module.clone();
+                let import_items = module.resolve_imports(file_curr_parent_module.clone(), ctx);
+                module.change_visibility(record_fields);
+
+                let module_def =
+                    generate_module_def(&file_impl_parent, &module).indent(old_item_indent);
+                let module_decl = format!("mod {};", module.name);
+                let contents = extracted_module_contents(&module_def);
+                let path = file_path.clone();
+
+                let mut usages_to_be_processed_for_cur_file = vec![];
+                for (file_id, usages) in usages_to_be_processed {
+                    if file_id == ctx.vfs_file_id() {
+                        usages_to_be_processed_for_cur_file = usages;
+                        continue;
+                    }
+                    builder.edit_file(file_id);
+                    for (text_range, usage) in usages {
+                        builder.replace(text_range, usage)
+                    }
+                }
+
+                builder.edit_file(ctx.vfs_file_id());
+                for (text_range, usage) in usages_to_be_processed_for_cur_file {
+                    builder.replace(text_range, usage);
+                }
+
+                if let Some(impl_) = file_impl_parent.clone() {
+                    let nodes_to_be_removed = if impl_child_count == old_items.len() {
+                        vec![impl_.syntax().clone()]
+                    } else {
+                        file_old_items.iter().map(|it| it.syntax().clone()).collect()
+                    };
+
+                    for node_to_be_removed in nodes_to_be_removed {
+                        builder.delete(node_to_be_removed.text_range());
+                        if let Some(range) = indent_range_before_given_node(&node_to_be_removed) {
+                            builder.delete(range);
+                        }
+                    }
+
+                    builder.insert(
+                        impl_.syntax().text_range().end(),
+                        format!("\n\n{old_item_indent}{module_decl}"),
+                    );
+                } else {
+                    for import_item in import_items {
+                        if !module_text_range.contains_range(import_item) {
+                            builder.delete(import_item);
+                        }
+                    }
+                    builder.replace(module_text_range, module_decl);
+                }
+
+                let dst = AnchoredPathBuf { anchor: ctx.vfs_file_id(), path };
+                builder.create_file(dst, contents);
+            },
+        );
+    }
+
+    Some(())
 }
 
 fn generate_module_def(
@@ -215,6 +315,48 @@ fn generate_module_def(
     make::mod_(module_name, Some(module_body))
 }
 
+fn extracted_module_contents(module: &ast::Module) -> String {
+    let items =
+        module.item_list().map(|it| it.dedent(IndentLevel(1)).to_string()).unwrap_or_default();
+    let mut items = items.trim_start_matches('{').trim_end_matches('}').trim().to_owned();
+    if !items.is_empty() {
+        items.push('\n');
+    }
+    items
+}
+
+fn extracted_module_file_path(
+    ctx: &AssistContext<'_>,
+    curr_parent_module: Option<ast::Module>,
+    module_name: &str,
+) -> Option<String> {
+    let mut buf = String::from("./");
+    let db = ctx.db();
+    let file_module = ctx.sema.file_to_module_def(ctx.vfs_file_id())?;
+    match file_module.name(db) {
+        Some(name) if !file_module.is_mod_rs(db) && !file_module.has_path(db) => {
+            format_to!(buf, "{}/", name.as_str())
+        }
+        _ => (),
+    }
+
+    let segments = iter::successors(curr_parent_module, |module| module.parent())
+        .filter_map(|it| it.name())
+        .map(|name| SmolStr::from(name.text().trim_start_matches("r#")))
+        .collect_vec();
+    if !segments.is_empty() {
+        format_to!(buf, "{}/", segments.into_iter().rev().format("/"));
+    }
+
+    let module_name = module_name.trim_start_matches("r#");
+    if module_name == "mod" {
+        format_to!(buf, "{module_name}/mod.rs");
+    } else {
+        format_to!(buf, "{module_name}.rs");
+    }
+    Some(buf)
+}
+
 fn make_use_stmt_of_node_with_super(node_syntax: &SyntaxNode) -> ast::Item {
     let super_path = make::ext::ident_path("super");
     let node_path = make::ext::ident_path(&node_syntax.to_string());
@@ -227,7 +369,7 @@ fn make_use_stmt_of_node_with_super(node_syntax: &SyntaxNode) -> ast::Item {
     ast::Item::from(use_)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Module {
     name: &'static str,
     /// All items except use items.
@@ -828,7 +970,7 @@ fn indent_range_before_given_node(node: &SyntaxNode) -> Option<TextRange> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_assist, check_assist_not_applicable};
+    use crate::tests::{check_assist, check_assist_by_label, check_assist_not_applicable};
 
     use super::*;
 
@@ -973,6 +1115,36 @@ mod modname {
                     name + 2
                 }
             ",
+        )
+    }
+
+    #[test]
+    fn test_extract_module_to_file_from_root() {
+        check_assist_by_label(
+            extract_module,
+            "$0fn foo(name: i32) -> i32 {\n    name + 1\n}$0\n\nfn bar(name: i32) -> i32 {\n    foo(name) + 2\n}\n",
+            "//- /main.rs\nmod modname;\n\nfn bar(name: i32) -> i32 {\n    modname::foo(name) + 2\n}\n//- /modname.rs\npub(crate) fn foo(name: i32) -> i32 {\n    name + 1\n}\n",
+            "Extract module to file",
+        )
+    }
+
+    #[test]
+    fn test_extract_module_to_file_from_submodule() {
+        check_assist_by_label(
+            extract_module,
+            "//- /main.rs\nmod submod;\n//- /submod.rs\n$0fn foo() {}\n$0\n\nfn bar() {\n    foo();\n}\n",
+            "//- /submod.rs\nmod modname;\n\n\nfn bar() {\n    modname::foo();\n}\n//- /submod/modname.rs\npub(crate) fn foo() {}\n",
+            "Extract module to file",
+        )
+    }
+
+    #[test]
+    fn test_extract_module_to_file_from_impl() {
+        check_assist_by_label(
+            extract_module,
+            "struct A {}\n\nimpl A {\n    $0fn foo() {}$0\n    fn bar() {}\n}\n",
+            "//- /main.rs\nstruct A {}\n\nimpl A {\n    fn bar() {}\n}\n\nmod modname;\n//- /modname.rs\nuse super::A;\n\nimpl A {\n    pub(crate) fn foo() {}\n}\n",
+            "Extract module to file",
         )
     }
 
