@@ -7,10 +7,10 @@ use anyhow::Context;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use ide::{
-    AssistKind, AssistResolveStrategy, Cancellable, CompletionFieldsToResolve, FilePosition,
-    FileRange, FileStructureConfig, FindAllRefsConfig, HoverAction, HoverGotoTypeData,
-    InlayFieldsToResolve, Query, RangeInfo, ReferenceCategory, Runnable, RunnableKind,
-    SingleResolve, SourceChange, TextEdit,
+    AssistConfig, AssistKind, AssistResolveStrategy, Cancellable, CompletionFieldsToResolve,
+    FilePosition, FileRange, FileStructureConfig, FindAllRefsConfig, HoverAction,
+    HoverGotoTypeData, InlayFieldsToResolve, Query, RangeInfo, ReferenceCategory, Runnable,
+    RunnableKind, SingleResolve, SourceChange, TextEdit,
 };
 use ide_db::{FxHashMap, SymbolKind};
 use itertools::Itertools;
@@ -1474,6 +1474,8 @@ pub(crate) fn handle_code_action(
     let line_index = snap.file_line_index(file_id)?;
     let frange = try_default!(from_proto::file_range(&snap, &params.text_document, params.range)?);
     let source_root = snap.analysis.source_root_id(file_id)?;
+    let organize_imports_requested =
+        requested_source_organize_imports(params.context.only.as_deref());
 
     let mut assists_config = snap.config.assist(Some(source_root));
     assists_config.allowed = params
@@ -1518,6 +1520,35 @@ pub(crate) fn handle_code_action(
         res.push(code_action)
     }
 
+    if organize_imports_requested {
+        let mut diagnostics_config = snap.config.diagnostic_fixes(Some(source_root));
+        diagnostics_config.enabled = false;
+
+        let file_range = FileRange {
+            file_id,
+            range: TextRange::up_to(TextSize::of(&*snap.analysis.file_text(file_id)?)),
+        };
+        let organize_imports = snap
+            .analysis
+            .assists_with_fixes(
+                &AssistConfig {
+                    allowed: Some(vec![AssistKind::QuickFix]),
+                    ..assists_config.clone()
+                },
+                &diagnostics_config,
+                AssistResolveStrategy::All,
+                file_range,
+            )?
+            .into_iter()
+            .filter(|assist| assist.id.0 == "remove_unused_imports");
+
+        for assist in organize_imports {
+            let mut code_action = to_proto::code_action(&snap, &client_commands, assist, None)?;
+            code_action.kind = Some(lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS);
+            res.push(code_action);
+        }
+    }
+
     // Fixes from `cargo check`.
     for fix in snap
         .check_fixes
@@ -1540,6 +1571,14 @@ pub(crate) fn handle_code_action(
     }
 
     Ok(Some(res))
+}
+
+fn requested_source_organize_imports(only: Option<&[lsp_types::CodeActionKind]>) -> bool {
+    only.is_some_and(|only| {
+        only.iter().any(|kind| {
+            kind.as_str().starts_with(lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS.as_str())
+        })
+    })
 }
 
 pub(crate) fn handle_code_action_resolve(

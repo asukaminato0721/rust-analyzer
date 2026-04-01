@@ -268,6 +268,7 @@ impl ClientCapabilities {
                         CodeActionKind::REFACTOR_EXTRACT,
                         CodeActionKind::REFACTOR_INLINE,
                         CodeActionKind::REFACTOR_REWRITE,
+                        CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                     ]),
                     resolve_provider: Some(true),
                     work_done_progress_options: Default::default(),

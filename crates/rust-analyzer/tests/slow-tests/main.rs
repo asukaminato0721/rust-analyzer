@@ -813,6 +813,60 @@ fn main() {}
 }
 
 #[test]
+fn test_source_organize_imports_code_action() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = project(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+use std::fmt::Debug;
+
+fn main() {}
+"#,
+    )
+    .wait_until_workspace_is_loaded();
+
+    server.request::<CodeActionRequest>(
+        CodeActionParams {
+            text_document: server.doc_id("src/lib.rs"),
+            range: Range::new(Position::new(2, 0), Position::new(2, 0)),
+            context: CodeActionContext {
+                only: Some(vec![lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                ..Default::default()
+            },
+            partial_result_params: PartialResultParams::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+        json!([
+            {
+                "title": "Remove all unused imports",
+                "kind": "source.organizeImports",
+                "edit": {
+                    "changes": {
+                        "file://[..]/src/lib.rs": [
+                            {
+                                "newText": "",
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 1, "character": 0 }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        ]),
+    );
+}
+
+#[test]
 fn test_missing_module_code_action_in_json_project() {
     if skip_slow_tests() {
         return;
