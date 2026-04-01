@@ -89,6 +89,8 @@ fn actual_main() -> anyhow::Result<ExitCode> {
         flags::RustAnalyzerCmd::RunTests(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::RustcTests(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::PrimeCaches(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Supervise(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::SuperviseDaemon(cmd) => cmd.run()?,
     }
     Ok(ExitCode::SUCCESS)
 }

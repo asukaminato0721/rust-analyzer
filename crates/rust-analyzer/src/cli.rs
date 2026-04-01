@@ -13,6 +13,7 @@ mod run_tests;
 mod rustc_tests;
 mod scip;
 mod ssr;
+mod supervise;
 mod symbols;
 mod unresolved_references;
 

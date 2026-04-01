@@ -161,6 +161,20 @@ xflags::xflags! {
             optional --num-threads num_threads: usize
         }
 
+        /// [Unstable] Keep a rust-analyzer server session alive across editor restarts.
+        cmd supervise {
+            /// Shut the background daemon down after this many idle seconds.
+            optional --idle-timeout-secs idle_timeout_secs: u64
+        }
+
+        /// [Unstable] Internal helper used by `rust-analyzer supervise`.
+        cmd supervise-daemon {
+            required socket_path: PathBuf
+
+            /// Shut the background daemon down after this many idle seconds.
+            optional --idle-timeout-secs idle_timeout_secs: u64
+        }
+
         cmd ssr {
             /// A structured search replace rule (`$a.foo($b) ==>> bar($a, $b)`)
             repeated rule: SsrRule
@@ -223,6 +237,8 @@ pub enum RustAnalyzerCmd {
     Diagnostics(Diagnostics),
     UnresolvedReferences(UnresolvedReferences),
     PrimeCaches(PrimeCaches),
+    Supervise(Supervise),
+    SuperviseDaemon(SuperviseDaemon),
     Ssr(Ssr),
     Search(Search),
     Lsif(Lsif),
@@ -313,6 +329,18 @@ pub struct PrimeCaches {
     pub disable_proc_macros: bool,
     pub proc_macro_srv: Option<PathBuf>,
     pub num_threads: Option<usize>,
+}
+
+#[derive(Debug)]
+pub struct Supervise {
+    pub idle_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct SuperviseDaemon {
+    pub socket_path: PathBuf,
+
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug)]
