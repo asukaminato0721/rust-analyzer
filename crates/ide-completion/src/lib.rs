@@ -240,6 +240,17 @@ pub fn completions(
             CompletionAnalysis::NameRef(name_ref_ctx) => {
                 completions::complete_name_ref(acc, ctx, name_ref_ctx)
             }
+            CompletionAnalysis::UnexpandedMacroPath(path_ctx) => {
+                if let PathKind::Expr { expr_ctx } = &path_ctx.kind {
+                    completions::expr::complete_expr_path(acc, ctx, path_ctx, expr_ctx);
+                    completions::expr::complete_expr(acc, ctx);
+                    completions::dot::complete_undotted_self(acc, ctx, path_ctx, expr_ctx);
+                    completions::item_list::complete_item_list_in_expr(
+                        acc, ctx, path_ctx, expr_ctx,
+                    );
+                    completions::snippet::complete_expr_snippet(acc, ctx, path_ctx, expr_ctx);
+                }
+            }
             CompletionAnalysis::Lifetime(lifetime_ctx) => {
                 completions::lifetime::complete_label(acc, ctx, lifetime_ctx);
                 completions::lifetime::complete_lifetime(acc, ctx, lifetime_ctx);

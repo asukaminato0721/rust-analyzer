@@ -1,7 +1,10 @@
 //! Module responsible for analyzing the code surrounding the cursor for completion.
 use std::iter;
 
-use hir::{EnumVariant, ExpandResult, InFile, Semantics, Type, TypeInfo};
+use hir::{
+    EnumVariant, ExpandResult, InFile, ModuleDef, PathResolution, ScopeDef, Semantics, Type,
+    TypeInfo,
+};
 use ide_db::{
     RootDatabase, active_parameter::ActiveParameter, syntax_helpers::node_ext::find_loops,
 };
@@ -148,25 +151,17 @@ fn expand_maybe_stop(
         return result;
     }
 
-    // We can't check whether the fake expansion is inside macro call, because that requires semantic info.
-    // But hopefully checking just the real one should be enough.
-    if token_at_offset_ignore_whitespace(&original_file.value, original_offset + relative_offset)
-        .is_some_and(|original_token| {
-            !sema.is_inside_macro_call(original_file.with_value(&original_token))
-        })
-    {
-        // Recursion base case.
-        Some(ExpansionResult {
-            original_file: original_file.value,
-            speculative_file,
-            original_offset,
-            speculative_offset: fake_ident_token.text_range().start(),
-            fake_ident_token,
-            derive_ctx: None,
-        })
-    } else {
-        None
-    }
+    // Recursion base case. Even if we are still syntactically inside a macro call, we can often
+    // produce useful completions from the current file pair when the next expansion step fails on
+    // incomplete input.
+    Some(ExpansionResult {
+        original_file: original_file.value,
+        speculative_file,
+        original_offset,
+        speculative_offset: fake_ident_token.text_range().start(),
+        fake_ident_token,
+        derive_ctx: None,
+    })
 }
 
 fn expand(
@@ -447,7 +442,7 @@ fn analyze<'db>(
     let ExpansionResult {
         original_file,
         speculative_file,
-        original_offset: _,
+        original_offset,
         speculative_offset,
         fake_ident_token,
         derive_ctx,
@@ -525,6 +520,10 @@ fn analyze<'db>(
                 } else {
                     return None;
                 }
+            } else if p.kind() == SyntaxKind::TOKEN_TREE
+                && p.ancestors().any(|it| ast::MacroCall::can_cast(it.kind()))
+            {
+                return classify_unexpanded_macro_call(sema, original_offset, fake_ident_token, &p);
             } else {
                 return None;
             }
@@ -2019,6 +2018,167 @@ fn is_in_breakable(node: &SyntaxNode) -> Option<(BreakableKind, SyntaxNode)> {
             loop_body.syntax().text_range().contains_range(node.text_range())
                 .then_some((breakable, it))
         })
+}
+
+fn classify_unexpanded_macro_call<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    original_offset: TextSize,
+    fake_ident_token: SyntaxToken,
+    token_tree: &SyntaxNode,
+) -> Option<(CompletionAnalysis<'db>, (Option<Type<'db>>, Option<ast::NameOrNameRef>), QualifierCtx)>
+{
+    let scope =
+        sema.scope_at_offset(token_tree, original_offset).or_else(|| sema.scope(token_tree))?;
+    let edition = scope.krate().edition(sema.db);
+    let qualifier_segments = raw_qualifier_segments(&fake_ident_token);
+    let path_text = qualifier_segments
+        .as_ref()
+        .filter(|segments| !segments.is_empty())
+        .map(|segments| format!("{}::{COMPLETION_MARKER}", segments.join("::")))
+        .unwrap_or_else(|| COMPLETION_MARKER.to_owned());
+    let path = match syntax::hacks::parse_expr_from_str(&path_text, edition)? {
+        ast::Expr::PathExpr(expr) => expr.path()?,
+        _ => return None,
+    };
+
+    let qualified = if let Some(segments) = qualifier_segments.filter(|it| !it.is_empty()) {
+        Qualified::With {
+            path: path.qualifier()?,
+            resolution: resolve_raw_path(sema.db, &scope, &segments),
+            super_chain_len: None,
+        }
+    } else {
+        Qualified::No
+    };
+
+    let path_ctx = PathCompletionCtx {
+        has_call_parens: false,
+        has_macro_bang: false,
+        qualified,
+        parent: None,
+        path,
+        original_path: None,
+        kind: PathKind::Expr {
+            expr_ctx: PathExprCtx {
+                in_block_expr: token_tree.ancestors().any(|it| ast::StmtList::can_cast(it.kind())),
+                in_breakable: is_in_breakable(token_tree).unzip().0,
+                after_if_expr: false,
+                before_else_kw: false,
+                in_condition: false,
+                incomplete_let: false,
+                after_incomplete_let: false,
+                in_value: true,
+                ref_expr_parent: None,
+                after_amp: false,
+                is_func_update: None,
+                self_param: None,
+                innermost_ret_ty: None,
+                innermost_breakable_ty: None,
+                impl_: None,
+                in_match_guard: false,
+            },
+        },
+        has_type_args: false,
+        use_tree_parent: false,
+    };
+
+    Some((CompletionAnalysis::UnexpandedMacroPath(path_ctx), (None, None), QualifierCtx::default()))
+}
+
+fn raw_qualifier_segments(fake_ident_token: &SyntaxToken) -> Option<Vec<String>> {
+    let mut pieces = Vec::new();
+    let mut current = previous_non_trivia_token(fake_ident_token.clone());
+    while let Some(token) = current {
+        if is_raw_path_segment(&token) || matches!(token.kind(), T![:] | T![::]) {
+            current = previous_non_trivia_token(token.clone());
+            pieces.push(token.text().to_string());
+        } else {
+            break;
+        }
+    }
+    pieces.reverse();
+
+    let qualifier = pieces.concat();
+    let Some(qualifier) = qualifier.strip_suffix("::") else {
+        return Some(Vec::new());
+    };
+    if qualifier.is_empty() {
+        return Some(Vec::new());
+    }
+
+    qualifier.split("::").map(|segment| (!segment.is_empty()).then(|| segment.to_owned())).collect()
+}
+
+fn is_raw_path_segment(token: &SyntaxToken) -> bool {
+    token.kind().is_any_identifier()
+        || matches!(token.kind(), T![self] | T![super] | T![crate] | T![Self])
+}
+
+fn resolve_raw_path(
+    db: &RootDatabase,
+    scope: &hir::SemanticsScope<'_>,
+    segments: &[String],
+) -> Option<PathResolution> {
+    let mut segments = segments.iter();
+    let first = segments.next()?;
+    let mut current = resolve_raw_path_first_segment(db, scope, first)?;
+    for segment in segments {
+        current = resolve_raw_path_next_segment(db, scope.module(), current, segment)?;
+    }
+    Some(current)
+}
+
+fn resolve_raw_path_first_segment(
+    db: &RootDatabase,
+    scope: &hir::SemanticsScope<'_>,
+    segment: &str,
+) -> Option<PathResolution> {
+    match segment {
+        "self" => Some(PathResolution::Def(ModuleDef::Module(scope.module()))),
+        "crate" => Some(PathResolution::Def(ModuleDef::Module(scope.krate().root_module(db)))),
+        "super" => Some(PathResolution::Def(ModuleDef::Module(scope.module().parent(db)?))),
+        "Self" => None,
+        _ => {
+            let mut resolution = None;
+            scope.process_all_names(&mut |name, def| {
+                if resolution.is_none() && name.as_str() == segment {
+                    resolution = scope_def_to_path_resolution(def);
+                }
+            });
+            resolution
+        }
+    }
+}
+
+fn resolve_raw_path_next_segment(
+    db: &RootDatabase,
+    visible_from: hir::Module,
+    resolution: PathResolution,
+    segment: &str,
+) -> Option<PathResolution> {
+    match resolution {
+        PathResolution::Def(ModuleDef::Module(module)) => module
+            .scope(db, Some(visible_from))
+            .into_iter()
+            .find(|(name, _)| name.as_str() == segment)
+            .and_then(|(_, def)| scope_def_to_path_resolution(def)),
+        _ => None,
+    }
+}
+
+fn scope_def_to_path_resolution(scope_def: ScopeDef) -> Option<PathResolution> {
+    match scope_def {
+        ScopeDef::ModuleDef(def) => Some(PathResolution::Def(def)),
+        ScopeDef::GenericParam(param) => match param {
+            hir::GenericParam::TypeParam(param) => Some(PathResolution::TypeParam(param)),
+            hir::GenericParam::ConstParam(param) => Some(PathResolution::ConstParam(param)),
+            hir::GenericParam::LifetimeParam(_) => None,
+        },
+        ScopeDef::ImplSelfType(impl_) => Some(PathResolution::SelfType(impl_)),
+        ScopeDef::AdtSelfType(adt) => Some(PathResolution::Def(ModuleDef::Adt(adt))),
+        ScopeDef::Local(local) => Some(PathResolution::Local(local)),
+        ScopeDef::Label(_) | ScopeDef::Unknown => None,
+    }
 }
 
 fn is_in_block(node: &SyntaxNode) -> bool {

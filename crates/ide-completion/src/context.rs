@@ -375,6 +375,7 @@ pub(crate) enum NameRefKind<'db> {
 pub(crate) enum CompletionAnalysis<'db> {
     Name(NameContext),
     NameRef(NameRefContext<'db>),
+    UnexpandedMacroPath(PathCompletionCtx<'db>),
     Lifetime(LifetimeContext),
     /// The string the cursor is currently inside
     String {
@@ -760,8 +761,12 @@ impl<'db> CompletionContext<'db> {
             &original_token,
         )?;
 
-        // adjust for macro input, this still fails if there is no token written yet
-        let scope = sema.scope_at_offset(&token.parent()?, original_offset)?;
+        // adjust for macro input; if the offset-sensitive lookup fails on incomplete input, fall
+        // back to the surrounding node scope so completion can still proceed.
+        let token_parent = token.parent()?;
+        let scope = sema
+            .scope_at_offset(&token_parent, original_offset)
+            .or_else(|| sema.scope(&token_parent))?;
 
         let krate = scope.krate();
         let module = scope.module();

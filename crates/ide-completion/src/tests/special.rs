@@ -482,6 +482,57 @@ fn foo() {}
 }
 
 #[test]
+fn completes_in_macro_call_with_trailing_tokens() {
+    check_no_kw(
+        r#"
+macro_rules! m { ($e:expr) => { $e } }
+
+mod mutations {
+    pub fn take_stored_mana() {}
+}
+
+fn main() {
+    m!(|| {
+        mutations::ta$0
+        mutations::take_stored_mana();
+    });
+}
+"#,
+        expect![[r#"
+            fn take_stored_mana() fn()
+        "#]],
+    );
+
+    check_no_kw(
+        r#"
+macro_rules! outer {
+    ($($e:expr),* $(,)?) => { ($($e),*) }
+}
+
+fn at_dusk<T>(it: T) -> T {
+    it
+}
+
+mod mutations {
+    pub fn take_stored_mana() {}
+}
+
+fn main() {
+    outer![
+        at_dusk(|| {
+            mutations::ta$0
+            mutations::take_stored_mana();
+        }),
+    ];
+}
+"#,
+        expect![[r#"
+            fn take_stored_mana() fn()
+        "#]],
+    );
+}
+
+#[test]
 fn completes_macro_segment() {
     check(
         r#"
