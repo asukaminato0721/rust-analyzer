@@ -21,6 +21,14 @@ fn load_cargo(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     to_crate_graph(project_workspace, &mut Default::default())
 }
 
+fn load_cargo_with_metadata(
+    file: &str,
+    tweak: impl FnOnce(&mut Metadata),
+) -> (CrateGraphBuilder, ProcMacroPaths) {
+    let project_workspace = load_workspace_from_metadata_with(file, tweak);
+    to_crate_graph(project_workspace, &mut Default::default())
+}
+
 fn load_cargo_with_overrides(
     file: &str,
     cfg_overrides: CfgOverrides,
@@ -31,7 +39,15 @@ fn load_cargo_with_overrides(
 }
 
 fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
-    let meta: Metadata = get_test_json_file(file);
+    load_workspace_from_metadata_with(file, |_| {})
+}
+
+fn load_workspace_from_metadata_with(
+    file: &str,
+    tweak: impl FnOnce(&mut Metadata),
+) -> ProjectWorkspace {
+    let mut meta: Metadata = get_test_json_file(file);
+    tweak(&mut meta);
     let manifest_path =
         ManifestPath::try_from(AbsPathBuf::try_from(meta.workspace_root.clone()).unwrap()).unwrap();
     let cargo_workspace = CargoWorkspace::new(meta, manifest_path, Default::default(), false);
@@ -138,6 +154,20 @@ fn check_crate_graph(crate_graph: CrateGraphBuilder, expect: ExpectFile) {
     expect.assert_eq(&crate_graph);
 }
 
+fn assert_libc_is_excluded(crate_graph: &CrateGraphBuilder) {
+    assert_eq!(crate_graph.iter().count(), 4);
+    assert!(crate_graph.iter().all(|krate| {
+        crate_graph[krate]
+            .extra
+            .display_name
+            .as_ref()
+            .is_none_or(|name| name.canonical_name().as_str() != "libc")
+    }));
+    assert!(crate_graph.iter().all(|krate| {
+        crate_graph[krate].basic.dependencies.iter().all(|dep| dep.name.as_str() != "libc")
+    }));
+}
+
 #[test]
 fn cargo_hello_world_project_model_with_wildcard_overrides() {
     let cfg_overrides = CfgOverrides {
@@ -181,6 +211,35 @@ fn cargo_hello_world_project_model() {
         crate_graph,
         expect_file!["../test_data/output/cargo_hello_world_project_model.txt"],
     )
+}
+
+#[test]
+fn cargo_excludes_packages_from_workspace_metadata() {
+    let (crate_graph, _proc_macros) =
+        load_cargo_with_metadata("hello-world-metadata.json", |meta| {
+            meta.workspace_metadata = serde_json::json!({
+                "rust-analyzer": {
+                    "cargo": {
+                        "exclude": ["libc"],
+                    },
+                },
+            });
+        });
+    assert_libc_is_excluded(&crate_graph);
+}
+
+#[test]
+fn cargo_excludes_packages_from_package_metadata() {
+    let (crate_graph, _proc_macros) =
+        load_cargo_with_metadata("hello-world-metadata.json", |meta| {
+            let libc = meta.packages.iter_mut().find(|pkg| pkg.name == "libc").unwrap();
+            libc.metadata = serde_json::json!({
+                "rust-analyzer": {
+                    "skip": true,
+                },
+            });
+        });
+    assert_libc_is_excluded(&crate_graph);
 }
 
 #[test]

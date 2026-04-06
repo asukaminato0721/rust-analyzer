@@ -34,6 +34,7 @@ use crate::{
 pub struct CargoWorkspace {
     packages: Arena<PackageData>,
     targets: Arena<TargetData>,
+    excluded_packages: FxHashSet<Package>,
     workspace_root: AbsPathBuf,
     target_directory: AbsPathBuf,
     manifest_path: ManifestPath,
@@ -196,8 +197,10 @@ pub struct PackageData {
 }
 
 #[derive(Deserialize, Default, Debug, Clone, Eq, PartialEq)]
+#[serde(default)]
 pub struct RustAnalyzerPackageMetaData {
     pub rustc_private: bool,
+    pub skip: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -336,6 +339,26 @@ struct PackageMetadata {
     rust_analyzer: Option<RustAnalyzerPackageMetaData>,
 }
 
+#[derive(Deserialize, Default)]
+struct WorkspaceMetadata {
+    #[serde(rename = "rust-analyzer")]
+    rust_analyzer: Option<RustAnalyzerWorkspaceMetaData>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone, Eq, PartialEq)]
+#[serde(default)]
+struct RustAnalyzerWorkspaceMetaData {
+    #[serde(default)]
+    cargo: RustAnalyzerCargoMetaData,
+}
+
+#[derive(Deserialize, Default, Debug, Clone, Eq, PartialEq)]
+#[serde(default)]
+struct RustAnalyzerCargoMetaData {
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
 impl CargoWorkspace {
     pub fn new(
         mut meta: cargo_metadata::Metadata,
@@ -348,13 +371,17 @@ impl CargoWorkspace {
         let mut targets = Arena::default();
 
         let ws_members = &meta.workspace_members;
+        let workspace_meta = from_value::<WorkspaceMetadata>(meta.workspace_metadata.take())
+            .unwrap_or_default()
+            .rust_analyzer
+            .unwrap_or_default();
 
         let workspace_root = AbsPathBuf::assert(meta.workspace_root);
         let target_directory = AbsPathBuf::assert(meta.target_directory);
         let mut is_virtual_workspace = true;
-        let mut requires_rustc_private = false;
 
         let mut members = FxHashSet::default();
+        let mut package_name_counts = FxHashMap::<String, usize>::default();
 
         meta.packages.sort_by(|a, b| a.id.cmp(&b.id));
         for meta_pkg in meta.packages {
@@ -397,6 +424,7 @@ impl CargoWorkspace {
 
             let manifest = ManifestPath::try_from(AbsPathBuf::assert(manifest_path)).unwrap();
             is_virtual_workspace &= manifest != ws_manifest_path;
+            *package_name_counts.entry(name.to_string()).or_default() += 1;
             let pkg = packages.alloc(PackageData {
                 id: id.clone(),
                 name: name.to_string(),
@@ -423,9 +451,8 @@ impl CargoWorkspace {
             if is_member {
                 members.insert(pkg);
             }
-            let pkg_data = &mut packages[pkg];
-            requires_rustc_private |= pkg_data.metadata.rustc_private;
             pkg_by_id.insert(id, pkg);
+            let pkg_data = &mut packages[pkg];
             for meta_tgt in meta_targets {
                 let cargo_metadata::Target { name, kind, required_features, src_path, .. } =
                     meta_tgt;
@@ -467,6 +494,28 @@ impl CargoWorkspace {
                 .extend(node.features.into_iter().map(|it| it.to_string()));
         }
 
+        let excluded_packages = {
+            let excluded_by_name = FxHashSet::<Box<str>>::from_iter(
+                workspace_meta.cargo.exclude.into_iter().map(Box::<str>::from),
+            );
+            packages
+                .iter()
+                .filter_map(|(pkg, data)| {
+                    let package_flag = if package_name_counts[&data.name] == 1 {
+                        data.name.clone().into_boxed_str()
+                    } else {
+                        format!("{}:{}", data.name, data.version).into_boxed_str()
+                    };
+                    (data.metadata.skip
+                        || excluded_by_name.contains(data.name.as_str())
+                        || excluded_by_name.contains(package_flag.as_ref()))
+                    .then_some(pkg)
+                })
+                .collect::<FxHashSet<_>>()
+        };
+
+        members.retain(|pkg| !excluded_packages.contains(pkg));
+
         fn saturate_all_member_deps(
             packages: &mut Arena<PackageData>,
             to_visit: Package,
@@ -504,9 +553,14 @@ impl CargoWorkspace {
             saturate_all_member_deps(&mut packages, *member, &mut visited, &members);
         }
 
+        let requires_rustc_private = packages.iter().any(|(pkg, pkg_data)| {
+            !excluded_packages.contains(&pkg) && pkg_data.metadata.rustc_private
+        });
+
         CargoWorkspace {
             packages,
             targets,
+            excluded_packages: excluded_packages.clone(),
             workspace_root,
             target_directory,
             manifest_path: ws_manifest_path,
@@ -521,8 +575,16 @@ impl CargoWorkspace {
         self.packages.iter().map(|(id, _pkg)| id)
     }
 
+    pub fn packages_for_analysis(&self) -> impl Iterator<Item = Package> + '_ {
+        self.packages().filter(|pkg| !self.is_excluded(*pkg))
+    }
+
+    pub fn is_excluded(&self, pkg: Package) -> bool {
+        self.excluded_packages.contains(&pkg)
+    }
+
     pub fn target_by_root(&self, root: &AbsPath) -> Option<Target> {
-        self.packages()
+        self.packages_for_analysis()
             .filter(|&pkg| self[pkg].is_member)
             .find_map(|pkg| self[pkg].targets.iter().find(|&&it| self[it].root == root))
             .copied()
@@ -580,7 +642,7 @@ impl CargoWorkspace {
 
     /// Returns the union of the features of all member crates in this workspace.
     pub fn workspace_features(&self) -> FxHashSet<String> {
-        self.packages()
+        self.packages_for_analysis()
             .filter_map(|package| {
                 let package = &self[package];
                 if package.is_member {

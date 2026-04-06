@@ -804,7 +804,7 @@ impl ProjectWorkspace {
                 .collect::<Vec<_>>(),
             ProjectWorkspaceKind::Cargo { cargo, rustc, build_scripts, error: _ } => {
                 cargo
-                    .packages()
+                    .packages_for_analysis()
                     .map(|pkg| {
                         let is_local = cargo[pkg].is_local;
                         let pkg_root = cargo[pkg].manifest.parent().to_path_buf();
@@ -868,7 +868,7 @@ impl ProjectWorkspace {
                     exclude: Vec::new(),
                 })
                 .chain(cargo_script.iter().flat_map(|(cargo, build_scripts, _)| {
-                    cargo.packages().map(|pkg| {
+                    cargo.packages_for_analysis().map(|pkg| {
                         let is_local = cargo[pkg].is_local;
                         let pkg_root = cargo[pkg].manifest.parent().to_path_buf();
 
@@ -928,11 +928,13 @@ impl ProjectWorkspace {
             ProjectWorkspaceKind::Cargo { cargo, rustc, .. } => {
                 let rustc_package_len =
                     rustc.as_ref().map(|a| a.as_ref()).map_or(0, |(it, _)| it.packages().len());
-                cargo.packages().len() + sysroot_package_len + rustc_package_len
+                cargo.packages_for_analysis().count() + sysroot_package_len + rustc_package_len
             }
             ProjectWorkspaceKind::DetachedFile { cargo: cargo_script, .. } => {
                 sysroot_package_len
-                    + cargo_script.as_ref().map_or(1, |(cargo, _, _)| cargo.packages().len())
+                    + cargo_script
+                        .as_ref()
+                        .map_or(1, |(cargo, _, _)| cargo.packages_for_analysis().count())
             }
         }
     }
@@ -1243,7 +1245,7 @@ fn cargo_to_crate_graph(
     let workspace_proc_macro_cwd = Arc::new(cargo.workspace_root().to_path_buf());
 
     // Next, create crates for each package, target pair
-    for pkg in cargo.packages() {
+    for pkg in cargo.packages_for_analysis() {
         let cfg_options = {
             let mut cfg_options = cfg_options.clone();
 
@@ -1355,7 +1357,7 @@ fn cargo_to_crate_graph(
 
     // Now add a dep edge from all targets of upstream to the lib
     // target of downstream.
-    for pkg in cargo.packages() {
+    for pkg in cargo.packages_for_analysis() {
         for dep in &cargo[pkg].dependencies {
             let Some(&to) = pkg_to_lib_crate.get(&dep.pkg) else { continue };
             let Some(targets) = pkg_crates.get(&pkg) else { continue };
@@ -1580,7 +1582,7 @@ fn handle_rustc_crates(
         let name = CrateName::normalize_dashes(&rustc_workspace[dep].name);
 
         if let Some(&to) = pkg_to_lib_crate.get(&dep) {
-            for pkg in cargo.packages() {
+            for pkg in cargo.packages_for_analysis() {
                 let package = &cargo[pkg];
                 if !package.metadata.rustc_private {
                     continue;
