@@ -1141,6 +1141,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide-fmt"
+version = "0.0.0"
+dependencies = [
+ "expect-test",
+ "syntax",
+]
+
+[[package]]
 name = "ide-ssr"
 version = "0.0.0"
 dependencies = [
